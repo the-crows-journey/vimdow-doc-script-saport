@@ -1,0 +1,136 @@
+name: Release Vimdow plugin and standalone
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit to run on"
+        required: true
+        default: 'master'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build_library:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        profile: [debug, release]
+        include:
+          - libfile: libvimdow.so
+            os: ubuntu-latest
+          - libfile: libvimdow.dylib
+            os: macos-latest
+          - libfile: vimdow.dll
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Build ${{ matrix.profile }}
+        run: cargo build --manifest-path rust/Cargo.toml $([ "${{ matrix.profile }}" = "release" ] && echo "--release")
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: vimdow-lib-${{ matrix.profile }}-${{ matrix.os }}
+          path: |
+            rust/target/${{ matrix.profile }}/${{ matrix.libfile }}
+
+  release:
+    needs: build_library
+    runs-on: ubuntu-latest
+    env:
+      GODOT_VERSION: "4.6.2"
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download debug artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: vimdow-lib-debug-*
+          path: godot/addons/vimdow/bin/debug
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          pattern: vimdow-lib-release-*
+          path: godot/addons/vimdow/bin/release
+
+      - name: Setup exports
+        run: |
+          mkdir exports
+          cat > godot/project.godot << EOF
+          config_version=5
+
+          [application]
+
+          config/name="Vimdow"
+          config/features=PackedStringArray("4.6.2", "Forward Plus")
+          config/icon="res://icon.svg"
+          run/main_scene="res://addons/vimdow/vimdow_editor.tscn"
+
+          [display]
+
+          window/stretch/mode="canvas_items"
+          window/stretch/aspect="expand"
+
+          [editor_plugins]
+
+          enabled=PackedStringArray("res://addons/vimdow/plugin.cfg")
+
+          [physics]
+
+          3d/physics_engine="Jolt Physics"
+
+          [rendering]
+
+          rendering_device/driver.windows="d3d12"
+          textures/vram_compression/import_etc2_astc=true
+          EOF
+
+      - name: Export standalone
+        uses: firebelley/godot-export@v8.0.0
+        id: export
+        with:
+          godot_executable_download_url: "https://github.com/godotengine/godot/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_linux.x86_64.zip"
+          godot_export_templates_download_url: "https://github.com/godotengine/godot/releases/download/${{ env.GODOT_VERSION }}-stable/Godot_v${{ env.GODOT_VERSION }}-stable_export_templates.tpz"
+          relative_project_path: ./godot/
+          presets_to_export: "vimdow-standalone-linux,vimdow-standalone-win"
+          archive_output: true
+          archive_root_folder: true
+
+
+      - name: Add README and LICENSE
+        run: |
+          cp README.md godot/addons/vimdow/README.md
+          cp LICENSE godot/addons/vimdow/LICENSE
+
+      - name: Zip plugin
+        run: |
+          cd godot
+          zip -r ../vimdow-plugin.zip addons/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.ref || github.ref_name }}
+          files: |
+            vimdow-plugin.zip
+            ${{ steps.export.outputs.archive_directory }}/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

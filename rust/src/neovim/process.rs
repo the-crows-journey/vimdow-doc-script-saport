@@ -1,0 +1,189 @@
+use godot::prelude::*;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io::{self, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+use rmpv::Value;
+
+use crate::neovim::msgpack::godot_to_rmpv;
+
+pub struct NeovimProcess {
+    child: Child,
+    shutdown: Arc<AtomicBool>,
+    _from_handle: JoinHandle<()>,
+    _to_handle: JoinHandle<()>,
+    // the receiver that takes the decoded mspack values
+    from: mpsc::Receiver<Value>,
+    // the sender that writes encoded mspack values
+    to: mpsc::Sender<Vec<u8>>,
+
+    msgid: u32,
+
+    // requests sent by the client waiting for responses
+    pending_requests: HashSet<u32>,
+
+    // requests sent by the server waiting for responses
+    pending_responses: HashSet<u32>,
+}
+
+impl NeovimProcess {
+    pub fn new(program: &str, nvim_args: &[impl AsRef<OsStr>]) -> Result<Self, std::io::Error> {
+        let mut child_builder = match std::fs::canonicalize(program) {
+            Ok(path) => Command::new(path),
+            Err(_) => Command::new(program),
+        };
+        child_builder.stdin(Stdio::piped()).stdout(Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            child_builder.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        for arg in nvim_args {
+            child_builder.arg(arg);
+        }
+
+        let mut child = child_builder.spawn()?;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (to, recv_in_process) = mpsc::channel::<Vec<u8>>();
+        let mut stdin = child.stdin.take().expect("Stdin is not available");
+        let shutdown_to = shutdown.clone();
+        let to_handle = thread::spawn(move || {
+            while !shutdown_to.load(Ordering::Relaxed) {
+                if let Ok(buf) = recv_in_process.recv() {
+                    if let Err(e) = stdin.write_all(&buf[..]) {
+                        godot_error!("Couldn't write to neovim: {e}");
+                    }
+                }
+            }
+        });
+
+        let (send_from_process, from) = mpsc::channel();
+        let mut stdout = child.stdout.take().expect("Stdout is not available");
+        let shutdown_from = shutdown.clone();
+        let from_handle = thread::spawn(move || {
+            while !shutdown_from.load(Ordering::Relaxed) {
+                if let Ok(value) = rmpv::decode::read_value(&mut stdout) {
+                    send_from_process
+                        .send(value)
+                        .expect("Couldn't send decoded value");
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            shutdown,
+            to,
+            from,
+            _from_handle: from_handle,
+            _to_handle: to_handle,
+            msgid: 0,
+            pending_requests: HashSet::new(),
+            pending_responses: HashSet::new(),
+        })
+    }
+
+    pub fn check(&mut self) -> Option<Value> {
+        let v = self.from.try_recv().ok()?;
+
+        if let Value::Array(ref vec) = v
+            && let [Value::Integer(msgtype), Value::Integer(msgid), ..] = vec.as_slice()
+        // && let Some(1) = msgtype.as_i64()
+        {
+            match (msgtype.as_i64(), msgid.as_i64().map(|i| i as u32)) {
+                // request from server
+                (Some(0), Some(msgid)) => {
+                    self.pending_responses.insert(msgid);
+                }
+
+                // response from server
+                (Some(1), Some(msgid)) => {
+                    assert!(
+                        self.pending_requests.remove(&msgid),
+                        "No msgid ({msgid}), exists"
+                    );
+                }
+
+                _ => {}
+            }
+        } else if !v.is_array() {
+            godot_print!("Received a non-rpc value: {}", v);
+        }
+
+        Some(v)
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                godot_print!("Neovim process exited with: {status}");
+                false
+            }
+            Ok(None) => true,
+            Err(e) => {
+                godot_error!("Neovim process is dead: {e}");
+                false
+            }
+        }
+    }
+
+    pub fn var_request(&mut self, method: &str, params: VarArray) -> i32 {
+        let ogid = self.msgid;
+        let rpc = varray![0, ogid, method, &params];
+        let val = godot_to_rmpv(rpc.to_variant());
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &val).expect("Couldn't serialize request");
+        self.msgid += 1;
+        self.pending_requests.insert(ogid);
+
+        // self.to.send(buf).expect("Couldn't send serialized variant");
+        match self.to.send(buf) {
+            Err(se) => {
+                godot_error!("{se}")
+            }
+            _ => {}
+        }
+
+        ogid as i32
+    }
+
+    pub fn var_respond(&mut self, msgid: i32, error: Variant, result: Variant) {
+        let rpc = varray![1, msgid, &error, &result];
+        let val = godot_to_rmpv(rpc.to_variant());
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &val).expect("Couldn't serialize response");
+
+        assert!(
+            self.pending_responses.remove(&(msgid as u32)),
+            "No request from server of '{msgid}'"
+        );
+
+        if let Err(se) = self.to.send(buf) {
+            godot_error!("{se}")
+        }
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for NeovimProcess {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        let _ecode = self.child.kill();
+        let _ecode = self.child.wait();
+    }
+}
