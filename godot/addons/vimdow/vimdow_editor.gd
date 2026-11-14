@@ -25,6 +25,21 @@ var viewport_lock: Window
 var attached := false
 var dragging := false
 
+## Set once Godot (or the plugin) is tearing the editor down. A Neovim exit seen after this
+## is part of Godot's shutdown and must never trigger an automatic restart.
+var shutting_down := false
+
+## True while an automatic restart is in flight (prevents duplicate restarts, since
+## `neovim_quit` keeps firing every frame until the dead process is replaced).
+var _auto_restarting := false
+## Time of the last automatic restart, used to detect a restart loop (Neovim dying at once).
+var _last_auto_restart_msec := -100000
+const AUTO_RESTART_MIN_INTERVAL_MSEC := 2000
+
+## Extra nvim args given to the first `start`, reused by every restart so the Lua plugin
+## (`-S addons/vimdow/lua/start.lua`) is loaded again in the new instance.
+var _extra_nvim_args := PackedStringArray()
+
 ## Emitted after every neovim redraw has been applied (see `flush`).
 signal flushed
 
@@ -83,6 +98,7 @@ func _ready() -> void:
 
 
 func _exit_tree() -> void:
+	shutting_down = true
 	if not _is_standalone():
 		var es = _get_editor_interface().get_editor_settings()
 		es.remove_shortcut("vimdow/increase_font_size")
@@ -90,6 +106,9 @@ func _exit_tree() -> void:
 
 
 func start(extra_nvim_args := PackedStringArray()) -> void:
+	if not extra_nvim_args.is_empty():
+		_extra_nvim_args = extra_nvim_args
+	extra_nvim_args = _extra_nvim_args
 	if conf.get_value(MAIN_SECTION, "template", false):
 		show_error("Your config file has \"template=true\" in the neovim section. Remove that value to actually use your config in %s" % conf_path)
 		return
@@ -140,7 +159,8 @@ func start(extra_nvim_args := PackedStringArray()) -> void:
 	args.append_array(extra_nvim_args)
 	args.append_array(OS.get_cmdline_user_args())
 
-	client.spawn(conf.get_value(MAIN_SECTION, "path_to_nvim"), args)
+	if not client.spawn(conf.get_value(MAIN_SECTION, "path_to_nvim"), args):
+		return
 	await get_tree().create_timer(.1).timeout
 	assert(client.is_running())
 	var initial_size := get_editor_grid_size()
@@ -292,8 +312,27 @@ func _get_editor_interface():
 func quit(code: int):
 	if _is_standalone():
 		get_tree().quit()
-	else:
+		return
+
+	# Neovim exited because Godot is shutting down: leave it alone.
+	if shutting_down or not is_inside_tree():
+		return
+	# `neovim_quit` fires every frame while the dead process is still held.
+	if _auto_restarting:
+		return
+
+	attached = false
+	# Crash-loop protection: Neovim died right after an automatic restart.
+	if Time.get_ticks_msec() - _last_auto_restart_msec < AUTO_RESTART_MIN_INTERVAL_MSEC:
 		show_error("Neovim quit with exit code %d." % code)
+		return
+
+	_auto_restarting = true
+	_last_auto_restart_msec = Time.get_ticks_msec()
+	# Same underlying operation as the Restart Neovim button.
+	if not await restart_neovim() and not $NoNeovimRunning.visible:
+		show_error("Neovim quit with exit code %d and could not be restarted automatically." % code)
+	_auto_restarting = false
 
 
 # checks if vimdow is the standalone app or the editor plugin
@@ -629,12 +668,22 @@ func _on_viewport_lock_size_changed():
 
 
 func _on_restart_button_pressed() -> void:
+	restart_neovim()
+
+
+## Restarts Neovim. Used by the Restart button and by the automatic restart after a quit.
+## Returns true if a new Neovim instance was started and attached.
+func restart_neovim() -> bool:
 	$NoNeovimRunning.visible = false
 	$VimdowWindow.visible = true
 
 	#reload config
 	var result = conf.load(conf_path)
-	if result == OK:
-		call_deferred("start")
-	else:
+	if result != OK:
 		show_error("Couldn't reload config: %s" % error_string(result))
+		return false
+
+	# make sure the previous process is gone before spawning another
+	client.kill_process()
+	await start()
+	return attached and client.is_running()

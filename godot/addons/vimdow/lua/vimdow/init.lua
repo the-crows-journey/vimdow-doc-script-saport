@@ -132,6 +132,17 @@ function Vimdow.setup (opts)
 		end
 	end)
 
+	-- every successful write of a regular file (:w, :write, :wq, :x, mappings, ...)
+	-- tells Godot to save its own state too
+	vim.api.nvim_create_autocmd("BufWritePost", {
+		group = vim.api.nvim_create_augroup("VimdowSave", { clear = true }),
+		callback = function (args)
+			if vim.bo[args.buf].buftype == "" then
+				pcall(vim.rpcnotify, 1, "vimdow_saved", args.file)
+			end
+		end,
+	})
+
 	-- editor interface integration
 	Vimdow.ei = require "vimdow.editor"
 

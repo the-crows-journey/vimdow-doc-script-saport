@@ -124,6 +124,9 @@ func _on_doc_text_changed(page_name: String, lines: PackedStringArray) -> void:
 ## Neovim -> editor notifications about documentation documents.
 func _on_neovim_event(method: String, params: Array) -> void:
 	var m := method.lstrip('"').rstrip('"')
+	if m == "vimdow_saved":
+		_request_editor_save()
+		return
 	if not m.begins_with("vimdow_docs_") or params.is_empty() or not params[0] is Dictionary:
 		return
 	var data: Dictionary = params[0]
@@ -133,6 +136,31 @@ func _on_neovim_event(method: String, params: Array) -> void:
 			docs.apply_layout(data.get("entries", []), editor.get_cell_size(), origin)
 		"vimdow_docs_close":
 			docs.close_page(str(data.get("name", "")))
+
+## Neovim wrote a file (any :w/:write/:wq/:x, mapping or command): also save Godot's state.
+## Several writes in one frame (e.g. :wa) are coalesced into a single editor save.
+var _editor_save_pending := false
+
+func _request_editor_save() -> void:
+	if _editor_save_pending:
+		return
+	_editor_save_pending = true
+	_save_editor_state.call_deferred()
+
+func _save_editor_state() -> void:
+	_editor_save_pending = false
+	var root := EditorInterface.get_edited_scene_root()
+	# Unsaved, never-named scenes would need a Save As dialog: leave those alone.
+	if root == null or root.scene_file_path.is_empty():
+		return
+	var err := EditorInterface.save_scene()
+	if err != OK:
+		var msg := "Vimdow: Godot could not save the scene (%s)" % error_string(err)
+		push_warning(msg)
+		editor.client.request(
+			"nvim_exec_lua",
+			["vim.notify(..., vim.log.levels.WARN)", [msg]],
+		)
 
 func _on_neovim_request(msgid: int, method: String, params: Array):
 	var m := method.lstrip('"').rstrip('"')
@@ -163,6 +191,9 @@ func _on_neovim_request(msgid: int, method: String, params: Array):
 
 
 func _exit_tree() -> void:
+	if editor:
+		# Godot/plugin teardown: Neovim's exit from here on must not auto-restart.
+		editor.shutting_down = true
 	if scene_changed.is_connected(_on_scene_changed):
 		scene_changed.disconnect(_on_scene_changed)
 	if script_tab:
